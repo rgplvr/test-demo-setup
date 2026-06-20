@@ -1,0 +1,134 @@
+# kube-prometheus-stack values for local minikube.
+# No gp2 StorageClass, alertmanager → Anvay gateway on host, smaller footprint.
+#
+# Deploy:
+#   helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+#     -n observability --create-namespace -f k8s/observability/prometheus/values-local.yaml
+
+prometheus:
+  prometheusSpec:
+    retention: 3d
+    # Use default (ephemeral) storage in minikube — no PVC needed for local dev
+    storageSpec: {}
+    additionalScrapeConfigs:
+      - job_name: demo-services
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [demo]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            target_label: service
+
+  additionalPrometheusRulesMap:
+    demo-alerts:
+      groups:
+        - name: demo-services
+          interval: 15s
+          rules:
+            - alert: HighErrorRate
+              expr: |
+                sum by (service) (rate(http_requests_total{status=~"5.."}[2m]))
+                /
+                sum by (service) (rate(http_requests_total[2m])) > 0.05
+              for: 30s
+              labels:
+                severity: critical
+              annotations:
+                summary: "High error rate on {{ $labels.service }}"
+                description: "Error rate {{ $value | humanizePercentage }} (threshold 5%)"
+
+            - alert: ServiceDown
+              expr: up{job=~"demo-services"} == 0
+              for: 15s
+              labels:
+                severity: critical
+              annotations:
+                summary: "Service {{ $labels.service }} is down"
+
+            - alert: HighLatencyP95
+              expr: |
+                histogram_quantile(0.95,
+                  sum by (le, service) (rate(http_request_duration_seconds_bucket[5m]))
+                ) > 1.0
+              for: 1m
+              labels:
+                severity: warning
+              annotations:
+                summary: "High P95 latency on {{ $labels.service }}"
+                description: "P95 latency {{ $value | humanizeDuration }} (threshold 1s)"
+
+            - alert: OrderServiceErrors
+              expr: sum(rate(orders_created_total{status="failed"}[2m])) > 0
+              for: 30s
+              labels:
+                severity: warning
+              annotations:
+                summary: "Order failures detected"
+
+alertmanager:
+  alertmanagerSpec:
+    # No PVC in minikube
+    storage: {}
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      group_by: [alertname, service]
+      group_wait: 10s
+      group_interval: 1m
+      repeat_interval: 4h
+      receiver: anvay-webhook
+    receivers:
+      - name: anvay-webhook
+        webhook_configs:
+          # Anvay gateway on the host machine.
+          # On Mac with Docker driver: host.docker.internal resolves correctly.
+          # On Linux: replace with the host IP (ip route | grep default | awk '{print $3}')
+          - url: http://host.docker.internal:4000/api/events/alert
+            send_resolved: true
+            http_config:
+              authorization:
+                type: Bearer
+                # Must match ANVAY_WEBHOOK_TOKEN in apps/gateway/.env
+                credentials: anvay-demo-webhook-token
+
+grafana:
+  adminPassword: admin
+  persistence:
+    enabled: false
+  sidecar:
+    dashboards:
+      enabled: true
+
+# Reduce resource footprint for local dev
+defaultRules:
+  create: true
+  rules:
+    alertmanager: true
+    etcd: false
+    general: true
+    kubernetesApps: true
+    kubernetesResources: false
+    node: true
+    prometheus: true
+
+# Slim down for minikube
+kubeEtcd:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeControllerManager:
+  enabled: false
