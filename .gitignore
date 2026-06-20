@@ -2,6 +2,7 @@
 .env.*
 !.env.example
 .env.local
+local/alertmanager/webhook-token
 *.tfstate
 *.tfstate.*
 .terraform/

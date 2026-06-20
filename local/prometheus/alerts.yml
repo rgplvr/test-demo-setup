@@ -1,0 +1,46 @@
+groups:
+  - name: demo-services
+    interval: 15s
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          sum by (job) (rate(http_requests_total{status=~"5.."}[2m]))
+          /
+          sum by (job) (rate(http_requests_total[2m])) > 0.05
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "High error rate on {{ $labels.job }}"
+          description: "Error rate {{ $value | humanizePercentage }} on {{ $labels.job }} (threshold 5%)"
+
+      - alert: ServiceDown
+        expr: up == 0
+        for: 15s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service {{ $labels.job }} is down"
+          description: "{{ $labels.instance }} has been unreachable for more than 15 seconds"
+
+      - alert: HighLatencyP95
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, job) (rate(http_request_duration_seconds_bucket[5m]))
+          ) > 1.0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High P95 latency on {{ $labels.job }}"
+          description: "P95 latency {{ $value | humanizeDuration }} on {{ $labels.job }} (threshold 1s)"
+
+      - alert: OrderServiceErrors
+        expr: |
+          sum(rate(orders_created_total{status="failed"}[2m])) > 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Order failures detected"
+          description: "{{ $value | humanize }} failed orders/sec"

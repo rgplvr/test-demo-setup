@@ -46,6 +46,19 @@ for SECRET_NAME in "/${CLUSTER}/jwt-secret" "/${CLUSTER}/db-url"; do
   fi
 done
 
+# Write alertmanager webhook token file so alertmanager can read it
+WEBHOOK_TOKEN="${ANVAY_WEBHOOK_TOKEN:-}"
+WEBHOOK_FILE="$(dirname "$0")/../local/alertmanager/webhook-token"
+if [ -n "$WEBHOOK_TOKEN" ]; then
+  echo -n "$WEBHOOK_TOKEN" > "$WEBHOOK_FILE"
+  echo "==> Wrote alertmanager webhook-token file"
+else
+  echo "WARNING: ANVAY_WEBHOOK_TOKEN not set — alertmanager will fail to auth with Anvay"
+  echo -n "anvay-demo-webhook-token" > "$WEBHOOK_FILE"
+  echo "  Using default dev token: anvay-demo-webhook-token"
+  echo "  Set ANVAY_WEBHOOK_TOKEN=anvay-demo-webhook-token in apps/gateway/.env too"
+fi
+
 echo ""
 echo "==> LocalStack secrets seeded."
 echo "    Secrets Manager endpoint: ${ENDPOINT}"

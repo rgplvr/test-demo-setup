@@ -253,7 +253,8 @@ services:
   prometheus:
     image: prom/prometheus:v2.51.0
     volumes:
-      - ./local/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./local/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./local/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus_data:/prometheus
     command:
       - --config.file=/etc/prometheus/prometheus.yml
@@ -263,6 +264,22 @@ services:
     ports:
       - "9090:9090"
     networks: [demo]
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - ./local/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      # Write ANVAY_WEBHOOK_TOKEN into a file so alertmanager can read it.
+      # Create this file from .env.local: echo "$ANVAY_WEBHOOK_TOKEN" > local/alertmanager/webhook-token
+      - ./local/alertmanager/webhook-token:/etc/alertmanager/webhook-token:ro
+    ports:
+      - "9093:9093"
+    networks: [demo]
+    depends_on: [prometheus]
     restart: unless-stopped
 
   grafana:

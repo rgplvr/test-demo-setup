@@ -1,0 +1,23 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  group_by: [alertname, service]
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 4h
+  receiver: anvay
+
+receivers:
+  - name: anvay
+    webhook_configs:
+      # Anvay gateway runs on host — use host.docker.internal so alertmanager
+      # can reach it from inside the demo Docker network.
+      # On Linux: replace host.docker.internal with 172.17.0.1
+      - url: http://host.docker.internal:4000/api/events/alert
+        send_resolved: true
+        http_config:
+          authorization:
+            type: Bearer
+            # Must match ANVAY_WEBHOOK_TOKEN in apps/gateway/.env
+            credentials_file: /etc/alertmanager/webhook-token
