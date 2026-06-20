@@ -1,0 +1,313 @@
+version: "3.9"
+
+# Local stack — no AWS account needed.
+# LocalStack simulates: Secrets Manager, S3 (for tf state), ECR (read-only sim)
+# Postgres replaces RDS, Redis replaces ElastiCache, no EKS needed (plain containers).
+#
+# Usage:
+#   cp .env.example .env.local && fill in
+#   docker compose -f docker-compose.local.yml --env-file .env.local up -d
+#   ./scripts/local-seed.sh          ← seeds LocalStack secrets
+
+x-service-base: &service-base
+  restart: unless-stopped
+  networks: [demo]
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    localstack:
+      condition: service_healthy
+  environment:
+    NODE_ENV: production
+    DATABASE_URL: postgres://demo:demo@postgres:5432/demo
+    REDIS_URL: redis://redis:6379
+    # Redirect AWS SDK calls to LocalStack
+    AWS_ENDPOINT_URL: http://localstack:4566
+    AWS_ACCESS_KEY_ID: test
+    AWS_SECRET_ACCESS_KEY: test
+    AWS_REGION: us-east-1
+
+services:
+  # ── Infrastructure ──────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: demo
+      POSTGRES_DB: demo
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [demo]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demo"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    networks: [demo]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  localstack:
+    image: localstack/localstack:3
+    environment:
+      SERVICES: secretsmanager,s3,iam,ecr
+      DEFAULT_REGION: us-east-1
+      LOCALSTACK_AUTH_TOKEN: ""
+    ports:
+      - "4566:4566"
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: [demo]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+
+  # ── Services ─────────────────────────────────────────────────────────────────
+
+  auth-service:
+    <<: *service-base
+    build: ./services/auth-service
+    environment:
+      <<: &env-common
+        NODE_ENV: production
+        DATABASE_URL: postgres://demo:demo@postgres:5432/demo
+        REDIS_URL: redis://redis:6379
+        AWS_ENDPOINT_URL: http://localstack:4566
+        AWS_ACCESS_KEY_ID: test
+        AWS_SECRET_ACCESS_KEY: test
+        AWS_REGION: us-east-1
+        JWT_SECRET: ${JWT_SECRET:-local-dev-secret-change-me}
+      PORT: "3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  user-service:
+    <<: *service-base
+    build: ./services/user-service
+    environment:
+      <<: *env-common
+      PORT: "3000"
+
+  product-service:
+    <<: *service-base
+    build: ./services/product-service
+    environment:
+      <<: *env-common
+      PORT: "3000"
+
+  cart-service:
+    <<: *service-base
+    build: ./services/cart-service
+    environment:
+      <<: *env-common
+      PORT: "3000"
+
+  order-service:
+    <<: *service-base
+    build: ./services/order-service
+    environment:
+      <<: *env-common
+      PORT: "3000"
+      PAYMENT_SERVICE_URL: http://payment-service:3000
+      INVENTORY_SERVICE_URL: http://inventory-service:3000
+      NOTIFICATION_SERVICE_URL: http://notification-service:3000
+
+  payment-service:
+    <<: *service-base
+    build: ./services/payment-service
+    environment:
+      <<: *env-common
+      PORT: "3000"
+
+  inventory-service:
+    <<: *service-base
+    build: ./services/inventory-service
+    environment:
+      <<: *env-common
+      PORT: "3000"
+
+  notification-service:
+    <<: *service-base
+    build: ./services/notification-service
+    environment:
+      <<: *env-common
+      PORT: "3000"
+
+  search-service:
+    <<: *service-base
+    build: ./services/search-service
+    environment:
+      <<: *env-common
+      PORT: "3000"
+
+  recommendation-service:
+    <<: *service-base
+    build: ./services/recommendation-service
+    environment:
+      <<: *env-common
+      PORT: "3000"
+
+  review-service:
+    <<: *service-base
+    build: ./services/review-service
+    environment:
+      <<: *env-common
+      PORT: "3000"
+
+  shipping-service:
+    <<: *service-base
+    build: ./services/shipping-service
+    environment:
+      <<: *env-common
+      PORT: "3000"
+
+  analytics-service:
+    <<: *service-base
+    build: ./services/analytics-service
+    environment:
+      <<: *env-common
+      PORT: "3000"
+
+  admin-service:
+    <<: *service-base
+    build: ./services/admin-service
+    environment:
+      <<: *env-common
+      PORT: "3000"
+
+  api-gateway:
+    <<: *service-base
+    build: ./services/api-gateway
+    ports:
+      - "8080:3000"
+    environment:
+      <<: *env-common
+      PORT: "3000"
+      AUTH_SERVICE_URL: http://auth-service:3000
+      USER_SERVICE_URL: http://user-service:3000
+      PRODUCT_SERVICE_URL: http://product-service:3000
+      CART_SERVICE_URL: http://cart-service:3000
+      ORDER_SERVICE_URL: http://order-service:3000
+      PAYMENT_SERVICE_URL: http://payment-service:3000
+      INVENTORY_SERVICE_URL: http://inventory-service:3000
+      NOTIFICATION_SERVICE_URL: http://notification-service:3000
+      SEARCH_SERVICE_URL: http://search-service:3000
+      RECOMMENDATION_SERVICE_URL: http://recommendation-service:3000
+      REVIEW_SERVICE_URL: http://review-service:3000
+      SHIPPING_SERVICE_URL: http://shipping-service:3000
+      ANALYTICS_SERVICE_URL: http://analytics-service:3000
+      ADMIN_SERVICE_URL: http://admin-service:3000
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Runners ──────────────────────────────────────────────────────────────────
+
+  traffic-simulator:
+    build: ./runners/traffic-simulator
+    networks: [demo]
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+    environment:
+      GATEWAY_URL: http://api-gateway:3000
+      RPS: "10"
+    restart: unless-stopped
+
+  # Chaos runner in docker-compose mode: kubectl unavailable so it uses HTTP
+  # fault injection against services directly (latency, error injection).
+  chaos-runner:
+    build: ./runners/chaos-runner
+    networks: [demo]
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+    environment:
+      # In local mode, chaos runner targets services over HTTP rather than kubectl
+      CHAOS_MODE: http
+      GATEWAY_URL: http://api-gateway:3000
+      CHAOS_INTENSITY: "0.2"
+      CHAOS_INTERVAL_MS: "30000"
+    restart: unless-stopped
+
+  # ── Observability ────────────────────────────────────────────────────────────
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    volumes:
+      - ./local/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+    networks: [demo]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_DOMAIN: localhost
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./local/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./local/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3001:3000"
+    networks: [demo]
+    depends_on: [prometheus]
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:2.9.6
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - loki_data:/loki
+    ports:
+      - "3100:3100"
+    networks: [demo]
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:2.9.6
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./local/promtail.yml:/etc/promtail/config.yml:ro
+    command: -config.file=/etc/promtail/config.yml
+    networks: [demo]
+    restart: unless-stopped
+
+networks:
+  demo:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  localstack_data:
+  prometheus_data:
+  grafana_data:
+  loki_data:

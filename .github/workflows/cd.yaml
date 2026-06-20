@@ -1,4 +1,13 @@
-name: CD — Deploy to EKS
+name: CD — Notify Anvay (deploy gate)
+
+# CI builds + pushes image. CD sends a deploy_trigger event to Anvay.
+# Anvay's Deploy Agent:
+#   1. Resolves the service in the Knowledge Graph (connector coordinates → Spinnaker app)
+#   2. Surfaces a deploy gate: "Deploy order-service:a1b2c3d to prod — approve?"
+#   3. On approval (human or auto-policy), triggers the Spinnaker pipeline via connector
+#   4. Monitors rollout via Prometheus connector
+#   5. On failure: auto-rollback via Spinnaker connector, creates incident in graph
+#   6. Full audit logged — who approved, what deployed, duration, outcome
 
 on:
   workflow_run:
@@ -8,15 +17,14 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: Image tag to deploy (default: latest sha from main)
+        description: Image tag to deploy
+        required: false
+      service:
+        description: Single service to deploy (blank = all changed services)
         required: false
 
-env:
-  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
-  CLUSTER_NAME: ${{ vars.CLUSTER_NAME || 'anvay-demo' }}
-
 jobs:
-  deploy:
+  notify-anvay:
     if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     permissions:
@@ -30,95 +38,79 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
 
       - name: Login to ECR
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Update kubeconfig
-        run: aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.CLUSTER_NAME }}
-
-      - name: Set image tag
+      - name: Resolve image tag and changed services
         id: vars
         run: |
           TAG="${{ github.event.inputs.image_tag }}"
           if [ -z "$TAG" ]; then
-            TAG="${{ github.event.workflow_run.head_sha }}"
-            TAG="${TAG:0:7}"
+            SHA="${{ github.event.workflow_run.head_sha }}"
+            TAG="${SHA:0:7}"
           fi
           echo "tag=${TAG}" >> $GITHUB_OUTPUT
           echo "registry=${{ steps.ecr-login.outputs.registry }}" >> $GITHUB_OUTPUT
+          echo "sha=${{ github.event.workflow_run.head_sha || github.sha }}" >> $GITHUB_OUTPUT
 
-      - name: Apply namespaces and config
-        run: |
-          kubectl apply -f k8s/namespaces/
-          kubectl apply -f k8s/services/configmap.yaml
+          # Detect changed services from CI run (or use workflow_dispatch input)
+          SVC="${{ github.event.inputs.service }}"
+          if [ -z "$SVC" ]; then
+            # All services (CI matrix always builds all on main push)
+            SVC="api-gateway,auth-service,user-service,product-service,cart-service,order-service,payment-service,inventory-service,notification-service,search-service,recommendation-service,review-service,shipping-service,analytics-service,admin-service"
+          fi
+          echo "services=${SVC}" >> $GITHUB_OUTPUT
 
-      - name: Inject secrets via ESO (External Secrets)
-        run: kubectl apply -f k8s/services/secrets-injection.yaml
-
-      - name: Deploy services
+      - name: Send deploy_trigger event to Anvay
         env:
-          ECR_REGISTRY: ${{ steps.vars.outputs.registry }}
-          IMAGE_TAG: ${{ steps.vars.outputs.tag }}
-          APP_IRSA_ROLE_ARN: ${{ secrets.APP_IRSA_ROLE_ARN }}
+          ANVAY_GATEWAY_URL: ${{ secrets.ANVAY_GATEWAY_URL }}
+          ANVAY_CONNECTOR_KEY: ${{ secrets.ANVAY_CONNECTOR_KEY }}
+          ANVAY_TENANT_ID: ${{ secrets.ANVAY_TENANT_ID }}
         run: |
-          set -e
-          for SVC_DIR in k8s/services/*/; do
-            SVC=$(basename "$SVC_DIR")
-            if [ -f "$SVC_DIR/deployment.yaml" ]; then
-              # Substitute placeholders — no secrets, only registry/tag/role
-              sed \
-                -e "s|\${ECR_REGISTRY}|${ECR_REGISTRY}|g" \
-                -e "s|\${IMAGE_TAG}|${IMAGE_TAG}|g" \
-                "$SVC_DIR/deployment.yaml" | kubectl apply -f -
-              echo "Deployed $SVC:${IMAGE_TAG}"
-            fi
+          ECR_REGISTRY="${{ steps.ecr-login.outputs.registry }}"
+          IMAGE_TAG="${{ steps.vars.outputs.tag }}"
+          SHA="${{ steps.vars.outputs.sha }}"
+          SERVICES="${{ steps.vars.outputs.services }}"
+
+          # Split CSV services and fire one event per service
+          IFS=',' read -ra SVC_LIST <<< "$SERVICES"
+          for SVC in "${SVC_LIST[@]}"; do
+            IMAGE_URI="${ECR_REGISTRY}/anvay-demo/${SVC}:${IMAGE_TAG}"
+            echo "Notifying Anvay: deploy ${SVC}:${IMAGE_TAG}"
+
+            curl -sf -X POST "${ANVAY_GATEWAY_URL}/api/graph/events" \
+              -H "Content-Type: application/json" \
+              -H "x-connector-key: ${ANVAY_CONNECTOR_KEY}" \
+              --data-raw "{
+                \"type\": \"deploy_trigger\",
+                \"tenantId\": \"${ANVAY_TENANT_ID}\",
+                \"service\": \"${SVC}\",
+                \"sha\": \"${SHA}\",
+                \"imageUri\": \"${IMAGE_URI}\",
+                \"repo\": \"rgplvr/test-demo-setup\",
+                \"environment\": \"prod\",
+                \"triggeredBy\": \"github-actions\",
+                \"workflowRun\": \"${{ github.run_id }}\",
+                \"commitMessage\": \"${{ github.event.workflow_run.head_commit.message || 'manual trigger' }}\"
+              }" || echo "WARNING: Anvay notification failed for ${SVC} — check ANVAY_GATEWAY_URL and ANVAY_CONNECTOR_KEY secrets"
           done
-
-      - name: Wait for rollout
-        run: |
-          SERVICES=(api-gateway auth-service user-service product-service cart-service order-service payment-service inventory-service notification-service search-service recommendation-service review-service shipping-service analytics-service admin-service)
-          for SVC in "${SERVICES[@]}"; do
-            kubectl rollout status deployment/$SVC -n demo --timeout=120s || echo "WARNING: $SVC rollout timed out"
-          done
-
-      - name: Deploy runners
-        env:
-          ECR_REGISTRY: ${{ steps.vars.outputs.registry }}
-          IMAGE_TAG: ${{ steps.vars.outputs.tag }}
-        run: |
-          kubectl apply -f k8s/runners/ 2>/dev/null || true
-
-      - name: Deploy observability stack
-        env:
-          GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
-          ANVAY_WEBHOOK_URL: ${{ secrets.ANVAY_WEBHOOK_URL }}
-        run: |
-          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-          helm repo add grafana https://grafana.github.io/helm-charts
-          helm repo update
-
-          # Substitute secrets at deploy time — never in files
-          sed -e "s|\${GRAFANA_ADMIN_PASSWORD}|${GRAFANA_ADMIN_PASSWORD}|g" \
-              -e "s|\${ANVAY_WEBHOOK_URL}|${ANVAY_WEBHOOK_URL}|g" \
-              k8s/observability/prometheus/values.yaml > /tmp/prometheus-values.yaml
-
-          helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
-            -n observability --create-namespace \
-            -f /tmp/prometheus-values.yaml \
-            --timeout 10m
-
-          helm upgrade --install loki grafana/loki-stack \
-            -n observability \
-            -f k8s/observability/loki/values.yaml \
-            --timeout 5m
-
-          kubectl apply -f k8s/observability/grafana/dashboards-configmap.yaml
 
       - name: Summary
         run: |
-          echo "=== Deployment complete ==="
-          echo "Image tag: ${{ steps.vars.outputs.tag }}"
-          kubectl get pods -n demo
+          echo "==================================="
+          echo " Anvay deploy gate triggered"
+          echo "==================================="
+          echo " Services : ${{ steps.vars.outputs.services }}"
+          echo " Image tag: ${{ steps.vars.outputs.tag }}"
+          echo " Anvay will:"
+          echo "   1. Surface deploy gate in UI (who/what/confidence)"
+          echo "   2. On approval → trigger Spinnaker pipeline"
+          echo "   3. Monitor rollout via Prometheus"
+          echo "   4. Auto-rollback on error rate spike"
+          echo "   5. Audit log the full flow"
+          echo ""
+          echo " Check Anvay UI or run:"
+          echo "   anvay deploy status ${{ steps.vars.outputs.tag }}"
