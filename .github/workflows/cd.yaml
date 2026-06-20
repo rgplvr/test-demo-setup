@@ -1,0 +1,124 @@
+name: CD — Deploy to EKS
+
+on:
+  workflow_run:
+    workflows: ["CI — Build & Push"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Image tag to deploy (default: latest sha from main)
+        required: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  CLUSTER_NAME: ${{ vars.CLUSTER_NAME || 'anvay-demo' }}
+
+jobs:
+  deploy:
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC — no static keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.CLUSTER_NAME }}
+
+      - name: Set image tag
+        id: vars
+        run: |
+          TAG="${{ github.event.inputs.image_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="${{ github.event.workflow_run.head_sha }}"
+            TAG="${TAG:0:7}"
+          fi
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "registry=${{ steps.ecr-login.outputs.registry }}" >> $GITHUB_OUTPUT
+
+      - name: Apply namespaces and config
+        run: |
+          kubectl apply -f k8s/namespaces/
+          kubectl apply -f k8s/services/configmap.yaml
+
+      - name: Inject secrets via ESO (External Secrets)
+        run: kubectl apply -f k8s/services/secrets-injection.yaml
+
+      - name: Deploy services
+        env:
+          ECR_REGISTRY: ${{ steps.vars.outputs.registry }}
+          IMAGE_TAG: ${{ steps.vars.outputs.tag }}
+          APP_IRSA_ROLE_ARN: ${{ secrets.APP_IRSA_ROLE_ARN }}
+        run: |
+          set -e
+          for SVC_DIR in k8s/services/*/; do
+            SVC=$(basename "$SVC_DIR")
+            if [ -f "$SVC_DIR/deployment.yaml" ]; then
+              # Substitute placeholders — no secrets, only registry/tag/role
+              sed \
+                -e "s|\${ECR_REGISTRY}|${ECR_REGISTRY}|g" \
+                -e "s|\${IMAGE_TAG}|${IMAGE_TAG}|g" \
+                "$SVC_DIR/deployment.yaml" | kubectl apply -f -
+              echo "Deployed $SVC:${IMAGE_TAG}"
+            fi
+          done
+
+      - name: Wait for rollout
+        run: |
+          SERVICES=(api-gateway auth-service user-service product-service cart-service order-service payment-service inventory-service notification-service search-service recommendation-service review-service shipping-service analytics-service admin-service)
+          for SVC in "${SERVICES[@]}"; do
+            kubectl rollout status deployment/$SVC -n demo --timeout=120s || echo "WARNING: $SVC rollout timed out"
+          done
+
+      - name: Deploy runners
+        env:
+          ECR_REGISTRY: ${{ steps.vars.outputs.registry }}
+          IMAGE_TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          kubectl apply -f k8s/runners/ 2>/dev/null || true
+
+      - name: Deploy observability stack
+        env:
+          GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+          ANVAY_WEBHOOK_URL: ${{ secrets.ANVAY_WEBHOOK_URL }}
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo add grafana https://grafana.github.io/helm-charts
+          helm repo update
+
+          # Substitute secrets at deploy time — never in files
+          sed -e "s|\${GRAFANA_ADMIN_PASSWORD}|${GRAFANA_ADMIN_PASSWORD}|g" \
+              -e "s|\${ANVAY_WEBHOOK_URL}|${ANVAY_WEBHOOK_URL}|g" \
+              k8s/observability/prometheus/values.yaml > /tmp/prometheus-values.yaml
+
+          helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+            -n observability --create-namespace \
+            -f /tmp/prometheus-values.yaml \
+            --timeout 10m
+
+          helm upgrade --install loki grafana/loki-stack \
+            -n observability \
+            -f k8s/observability/loki/values.yaml \
+            --timeout 5m
+
+          kubectl apply -f k8s/observability/grafana/dashboards-configmap.yaml
+
+      - name: Summary
+        run: |
+          echo "=== Deployment complete ==="
+          echo "Image tag: ${{ steps.vars.outputs.tag }}"
+          kubectl get pods -n demo
